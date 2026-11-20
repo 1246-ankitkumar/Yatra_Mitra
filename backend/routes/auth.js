@@ -4,7 +4,6 @@
 // ------------------------------------------------------------
 import express from 'express';
 import bcrypt from 'bcryptjs';
-import crypto from 'crypto';
 import { User } from '../models/User.js';
 import { auth } from '../middleware/auth.js';
 import {
@@ -143,48 +142,6 @@ router.post('/change-password', auth, async (req, res) => {
   await user.save();
   clearLoginCookies(res);
   res.json({ ok: true, message: 'Password changed. Please login again.' });
-});
-
-// ---------- POST /api/auth/forgot-password ----------
-router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body || {};
-  const message = 'If the email exists, a reset token was generated.';
-  const user = email ? await User.findOne({ email: String(email).toLowerCase() }) : null;
-
-  if (!user) return res.json({ ok: true, message });
-
-  const rawToken = crypto.randomBytes(20).toString('hex');
-  user.resetPasswordToken = hashToken(rawToken);
-  user.resetPasswordExpires = new Date(Date.now() + 30 * 60 * 1000); // valid for 30 minutes
-  await user.save();
-
-  // A real app would e-mail this token. NEVER return it in production: anyone could then
-  // reset any account's password. It is only returned while developing, so the flow can be tested.
-  if (process.env.NODE_ENV === 'production') {
-    console.warn(`Password reset requested for ${user.email}, but no e-mail service is configured.`);
-    return res.json({ ok: true, message });
-  }
-  res.json({ ok: true, message, resetToken: rawToken });
-});
-
-// ---------- POST /api/auth/reset-password ----------
-router.post('/reset-password', async (req, res) => {
-  const { token, newPassword } = req.body || {};
-  if (!token || !newPassword) return res.status(400).json({ error: 'Token and new password required.' });
-  if (String(newPassword).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
-
-  const user = await User.findOne({
-    resetPasswordToken: hashToken(String(token)),
-    resetPasswordExpires: { $gt: new Date() }, // not expired yet
-  });
-  if (!user) return res.status(400).json({ error: 'Invalid or expired reset token.' });
-
-  user.password = await bcrypt.hash(String(newPassword), 10);
-  user.resetPasswordToken = null;
-  user.resetPasswordExpires = null;
-  user.refreshTokens = [];
-  await user.save();
-  res.json({ ok: true, message: 'Password reset successful. Please login.' });
 });
 
 export default router;

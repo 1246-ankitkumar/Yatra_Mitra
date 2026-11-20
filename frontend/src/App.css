@@ -889,6 +889,17 @@ select {
   background: rgba(238, 242, 255, 0.9);
 }
 
+.route-stop-suggestions .search-result {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.route-stop-suggestions .search-result small {
+  color: var(--muted);
+  font-weight: 500;
+  text-align: right;
+}
+
 .ai-copilot-card {
   display: flex;
   flex-direction: column;

@@ -5,6 +5,7 @@ import { useLocation } from 'react-router-dom';
 import { Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { destinationsApi, tripsApi } from '../api/client';
 import { formatINR } from '../utils/format.js';
+import { findBestOrder } from '../utils/routeOptimizer.js';
 import '../App.css';
 
 async function fetchPlaces(query) {
@@ -102,6 +103,9 @@ function PlannerPage() {
   const [exportError, setExportError] = useState('');
   const [savedTrips, setSavedTrips] = useState([]);
   const [saveTripMessage, setSaveTripMessage] = useState('');
+  const [activeTripId, setActiveTripId] = useState(null);
+  const [suggestedStops, setSuggestedStops] = useState([]);
+  const [suggestedStopsLoading, setSuggestedStopsLoading] = useState(false);
 
   async function refreshSavedTrips() {
     try {
@@ -111,6 +115,108 @@ function PlannerPage() {
   }
 
   useEffect(() => { refreshSavedTrips(); }, []);
+
+  useEffect(() => {
+    const query = stopInput.trim();
+    if (query.length < 2) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setSearchLoading(true);
+      setSearchError('');
+      try {
+        const places = await fetchPlaces(query);
+        if (!cancelled) setSearchResults(places);
+      } catch {
+        if (!cancelled) setSearchResults([]);
+      } finally {
+        if (!cancelled) setSearchLoading(false);
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [stopInput]);
+
+  useEffect(() => {
+    async function loadRouteSuggestions() {
+      let routePoints = [];
+
+      const routeCoordinates = routeData?.geometry?.coordinates;
+      if (Array.isArray(routeCoordinates) && routeCoordinates.length > 1) {
+        const sampleCount = 5;
+        for (let index = 1; index <= sampleCount; index += 1) {
+          const position = Math.floor((routeCoordinates.length - 1) * index / (sampleCount + 1));
+          const point = routeCoordinates[position];
+          if (Array.isArray(point) && Number.isFinite(point[0]) && Number.isFinite(point[1])) {
+            routePoints.push({ lon: point[0], lat: point[1] });
+          }
+        }
+      } else if (selectedStartPlace && selectedFinalPlace) {
+        routePoints = [0.25, 0.5, 0.75].map((progress) => ({
+          lat: selectedStartPlace.lat + (selectedFinalPlace.lat - selectedStartPlace.lat) * progress,
+          lon: selectedStartPlace.lon + (selectedFinalPlace.lon - selectedStartPlace.lon) * progress,
+        }));
+      }
+
+      if (routePoints.length === 0) {
+        setSuggestedStops([]);
+        return;
+      }
+
+      setSuggestedStopsLoading(true);
+      try {
+        const responses = await Promise.all(
+          routePoints.map((point) => destinationsApi.nearbyPlaces({
+            lat: point.lat,
+            lon: point.lon,
+            radius: 5,
+          }).catch(() => null))
+        );
+
+        const excludedNames = new Set(
+          [
+            selectedStartPlace?.name,
+            selectedFinalPlace?.name,
+            ...stops.map((stop) => stop.name),
+          ].filter(Boolean).map((name) => String(name).toLowerCase())
+        );
+        const found = [];
+        const seenNames = new Set();
+
+        responses.forEach((response) => {
+          if (!Array.isArray(response?.places)) return;
+          response.places.forEach((place) => {
+            const name = String(place.name || '').trim();
+            const key = name.toLowerCase();
+            if (
+              !name ||
+              excludedNames.has(key) ||
+              seenNames.has(key) ||
+              !Number.isFinite(place.lat) ||
+              !Number.isFinite(place.lon)
+            ) return;
+            seenNames.add(key);
+            found.push(place);
+          });
+        });
+
+        setSuggestedStops(found.slice(0, 10));
+      } catch {
+        setSuggestedStops([]);
+      } finally {
+        setSuggestedStopsLoading(false);
+      }
+    }
+
+    loadRouteSuggestions();
+  }, [routeData, selectedStartPlace, selectedFinalPlace, stops]);
 
 
   // Editable assumptions for the trip budget estimator (amounts in INR).
@@ -272,14 +378,79 @@ function PlannerPage() {
       estimatedTolls, estimatedTransportFares, estimatedTripDays, travellerCount,
     };
     try {
-      await tripsApi.create(snapshot);
+      if (activeTripId) {
+        await tripsApi.update(activeTripId, snapshot);
+        setSaveTripMessage('Saved trip updated.');
+      } else {
+        await tripsApi.create(snapshot);
+        setSaveTripMessage('Trip saved to your account.');
+      }
       await refreshSavedTrips();
-      setSaveTripMessage('Trip saved to your account.');
     } catch (err) {
       setSaveTripMessage(err.message || 'Could not save this trip.');
     }
   }
+
+  async function updateCurrentTrip() {
+    if (!activeTripId) {
+      setSaveTripMessage('Load a saved trip before updating it.');
+      return;
+    }
+    if ((!routeData && !transitDirectionsUrl) || !selectedStartPlace || !selectedFinalPlace) {
+      setSaveTripMessage('Plan a complete trip before updating it.');
+      return;
+    }
+
+    const tripName = `${selectedStartPlace.name} → ${selectedFinalPlace.name}`;
+    const snapshot = {
+      name: tripName,
+      savedAt: new Date().toISOString(),
+      startLocation, finalDestination, selectedStartPlace, selectedFinalPlace, stops,
+      selectedFinalHotel,
+      tripPreference, transportMode, transitDirectionsUrl,
+      routeData, routeComparison, departureDateTime, stopDurations, maxDrivingHoursPerDay,
+      overnightStays, attractionsByStop, attractionPreference,
+      fuelEfficiency, fuelPricePerLitre, accommodationPerNight, foodPerPersonPerDay,
+      estimatedTolls, estimatedTransportFares, estimatedTripDays, travellerCount,
+    };
+    try {
+      await tripsApi.update(activeTripId, snapshot);
+      await refreshSavedTrips();
+      setSaveTripMessage('Saved trip updated.');
+    } catch (err) {
+      setSaveTripMessage(err.message || 'Could not update this trip.');
+    }
+  }
+
+  async function saveAsNewCopy() {
+    if ((!routeData && !transitDirectionsUrl) || !selectedStartPlace || !selectedFinalPlace) {
+      setSaveTripMessage('Plan a complete trip before saving it.');
+      return;
+    }
+    const tripName = `${selectedStartPlace.name} → ${selectedFinalPlace.name}`;
+    const snapshot = {
+      name: tripName,
+      savedAt: new Date().toISOString(),
+      startLocation, finalDestination, selectedStartPlace, selectedFinalPlace, stops,
+      selectedFinalHotel,
+      tripPreference, transportMode, transitDirectionsUrl,
+      routeData, routeComparison, departureDateTime, stopDurations, maxDrivingHoursPerDay,
+      overnightStays, attractionsByStop, attractionPreference,
+      fuelEfficiency, fuelPricePerLitre, accommodationPerNight, foodPerPersonPerDay,
+      estimatedTolls, estimatedTransportFares, estimatedTripDays, travellerCount,
+    };
+    try {
+      await tripsApi.create(snapshot);
+      setActiveTripId(null);
+      await refreshSavedTrips();
+      setSaveTripMessage('Saved as a new copy.');
+    } catch (err) {
+      setSaveTripMessage(err.message || 'Could not save this trip.');
+    }
+  }
+
   function loadSavedTrip(trip) {
+    setActiveTripId(trip.id);
     setStartLocation(trip.startLocation ?? trip.selectedStartPlace?.label ?? '');
     setFinalDestination(trip.finalDestination ?? trip.selectedFinalPlace?.label ?? '');
     setSelectedStartPlace(trip.selectedStartPlace ?? null);
@@ -339,6 +510,9 @@ function PlannerPage() {
     try {
       await tripsApi.remove(tripId);
       setSavedTrips((prev) => prev.filter((trip) => trip.id !== tripId));
+      if (activeTripId === tripId) {
+        setActiveTripId(null);
+      }
       setSaveTripMessage('Saved trip removed.');
     } catch (err) {
       setSaveTripMessage(err.message || 'Could not delete trip.');
@@ -655,6 +829,22 @@ function PlannerPage() {
     setSearchError('');
   }
 
+  function addSuggestedStop(place) {
+    const newStop = {
+      id: crypto.randomUUID(),
+      name: place.name,
+      lat: place.lat,
+      lon: place.lon,
+    };
+
+    setStops((currentStops) => [...currentStops, newStop]);
+    setStopDurations((current) => ({ ...current, [newStop.id]: 60 }));
+    setStopInput('');
+    setSelectedPlace(null);
+    setSearchResults([]);
+    setSearchError('');
+  }
+
   // Remove a stop
   function removeStop(id) {
     setStops((currentStops) =>
@@ -773,11 +963,6 @@ async function planTrip(stopsToPlan = stops, options = {}) {
     setRouteError(`Choose a map search result for these intermediate stops: ${names}.`);
     return false;
   }
-  if (stopsToPlan.length > 10) {
-    setRouteError('The first version supports up to 10 intermediate stops.');
-    return false;
-  }
-
   setRouteLoading(true);
   setRouteError('');
   setRouteData(null);
@@ -858,82 +1043,11 @@ async function planTrip(stopsToPlan = stops, options = {}) {
         ...originalStops.map((_, index) => index + 1),
         places.length - 1,
       ];
+      const chosenOrder = findBestOrder(matrix, originalStops.length);
 
-      function totalCost(order) {
-        let total = 0;
-
-        for (let i = 0; i < order.length - 1; i++) {
-          const cost = matrix[order[i]][order[i + 1]];
-
-          if (!Number.isFinite(cost)) return Infinity;
-
-          total += cost;
-        }
-
-        return total;
+      if (!chosenOrder) {
+        throw new Error('Some stops could not be connected by road.');
       }
-
-      // Start with a nearest-neighbor order.
-      const remaining = new Set(
-        originalStops.map((_, index) => index + 1)
-      );
-
-      const candidate = [0];
-      let current = 0;
-
-      while (remaining.size > 0) {
-        let nextStop = null;
-        let lowestCost = Infinity;
-
-        for (const index of remaining) {
-          const cost = matrix[current][index];
-
-          if (Number.isFinite(cost) && cost < lowestCost) {
-            lowestCost = cost;
-            nextStop = index;
-          }
-        }
-
-        if (nextStop === null) {
-          throw new Error('Some stops could not be connected by road.');
-        }
-
-        candidate.push(nextStop);
-        remaining.delete(nextStop);
-        current = nextStop;
-      }
-
-      candidate.push(places.length - 1);
-
-      // Improve the order using 2-opt.
-      let improved = true;
-
-      while (improved) {
-        improved = false;
-
-        for (let i = 1; i < candidate.length - 2; i++) {
-          for (let j = i + 1; j < candidate.length - 1; j++) {
-            const trial = [...candidate];
-
-            const reversed = trial
-              .slice(i, j + 1)
-              .reverse();
-
-            trial.splice(i, reversed.length, ...reversed);
-
-            if (totalCost(trial) < totalCost(candidate) - 0.001) {
-              candidate.splice(0, candidate.length, ...trial);
-              improved = true;
-            }
-          }
-        }
-      }
-
-      // Never replace the original order with a worse result.
-      const chosenOrder =
-        totalCost(candidate) < totalCost(originalOrder)
-          ? candidate
-          : originalOrder;
 
       orderedStops = chosenOrder
         .slice(1, -1)
@@ -964,7 +1078,7 @@ async function planTrip(stopsToPlan = stops, options = {}) {
     }
 
     const routeResponse = await fetch(
-      `${routingBase}/route/v1/driving/${routeCoordinates}?overview=full&geometries=geojson&steps=true`
+      `${routingBase}/route/v1/driving/${routeCoordinates}?overview=full&geometries=geojson&steps=false`
     );
 
     if (!routeResponse.ok) {
@@ -1017,43 +1131,6 @@ function formatDistance(meters) {
   return meters >= 1000
     ? `${(meters / 1000).toFixed(1)} km`
     : `${Math.round(meters)} m`;
-}
-
-function getManeuverInstruction(step, destinationName) {
-  const maneuver = step.maneuver || {};
-  const type = maneuver.type || 'continue';
-  const modifier = maneuver.modifier ? ` ${maneuver.modifier}` : '';
-  const road = step.name ? ` onto ${step.name}` : '';
-
-  switch (type) {
-    case 'depart':
-      return `Start${step.name ? ` on ${step.name}` : ''}`;
-    case 'arrive':
-      return `Arrive at ${destinationName}`;
-    case 'turn':
-      return `Turn${modifier}${road}`;
-    case 'continue':
-      return `Continue${modifier || ' straight'}${step.name ? ` on ${step.name}` : ''}`;
-    case 'new name':
-      return `Continue${step.name ? ` onto ${step.name}` : ''}`;
-    case 'merge':
-      return `Merge${modifier}${road}`;
-    case 'fork':
-      return `Keep${modifier}${road}`;
-    case 'end of road':
-      return `At the end of the road, turn${modifier}${road}`;
-    case 'roundabout':
-    case 'rotary':
-      return `Enter the roundabout${maneuver.exit ? ` and take exit ${maneuver.exit}` : ''}${road}`;
-    case 'exit roundabout':
-      return `Exit the roundabout${road}`;
-    case 'roundabout turn':
-      return `At the roundabout, turn${modifier}${road}`;
-    case 'notification':
-      return `Continue${step.name ? ` on ${step.name}` : ''}`;
-    default:
-      return `${type.charAt(0).toUpperCase()}${type.slice(1)}${modifier}${road}`;
-  }
 }
 
   async function findOvernightStays(stop) {
@@ -1471,16 +1548,6 @@ function getManeuverInstruction(step, destinationName) {
       </section>
     `).join('');
 
-    const directionsHtml = routeData.legs.map((leg, index) => {
-      const from = index === 0 ? selectedStartPlace.name : stops[index - 1]?.name || 'Previous location';
-      const to = index === stops.length ? selectedFinalPlace.name : stops[index]?.name || 'Next location';
-      const steps = leg.steps || [];
-      const instructions = steps.length
-        ? `<ol>${steps.map((step) => `<li>${escapeHtml(getManeuverInstruction(step, to))}${step.ref ? ` (${escapeHtml(step.ref)})` : ''} <span class="muted">— ${escapeHtml(formatDistance(step.distance))}, ${escapeHtml(formatDuration(step.duration))}</span></li>`).join('')}</ol>`
-        : '<p class="muted">Detailed maneuver instructions are unavailable for this leg.</p>';
-      return `<section class="leg avoid-break"><h3>${index + 1}. ${escapeHtml(from)} → ${escapeHtml(to)}</h3><p class="muted">${escapeHtml(formatDistance(leg.distance))} · ${escapeHtml(formatDuration(leg.duration))} estimated travel</p>${instructions}</section>`;
-    }).join('');
-
     const accommodationHtml = Object.entries(overnightStays).map(([stopId, stays]) => {
       const stop = stops.find((item) => item.id === stopId);
       if (!stop || !stays?.length) return '';
@@ -1529,7 +1596,6 @@ function getManeuverInstruction(step, destinationName) {
       </div>
       <h2>Stops</h2><ol>${stopList}</ol>
       <h2>Day-wise schedule</h2>${daysHtml || '<p>No day-wise schedule is available.</p>'}
-      <h2>Turn-by-turn directions</h2>${directionsHtml}
       ${selectedFinalHotelHtml}
       ${accommodationHtml ? `<h2>Saved overnight options</h2>${accommodationHtml}` : ''}
       ${attractionHtml ? `<h2>Places to explore</h2>${attractionHtml}<p class="muted">OpenStreetMap listings are not verified for opening hours, ticket prices, accessibility, or safety.</p>` : ''}
@@ -1903,6 +1969,28 @@ function getManeuverInstruction(step, destinationName) {
             </button>
           </form>
 
+          {(suggestedStopsLoading || suggestedStops.length > 0) && (
+            <div className="search-results route-stop-suggestions">
+              <p>Suggested stops along your route:</p>
+              {suggestedStopsLoading && (
+                <span className="helper-text">Finding places between start and destination...</span>
+              )}
+              {suggestedStops.map((place) => (
+                <button
+                  key={place.id || `${place.lat}-${place.lon}-${place.name}`}
+                  type="button"
+                  className="search-result"
+                  onClick={() => addSuggestedStop(place)}
+                >
+                  <span>{place.name}</span>
+                  {Number.isFinite(place.distanceKm) && (
+                    <small>{place.distanceKm} km from this route point</small>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+
           {searchError && (
             <p className="helper-text" role="status">
               {searchError}
@@ -1911,7 +1999,7 @@ function getManeuverInstruction(step, destinationName) {
 
           {searchResults.length > 0 && (
             <div className="search-results">
-              <p>Choose a matching place:</p>
+              <p>Intermediate stop suggestions:</p>
 
               {searchResults.map((place) => (
 
@@ -2243,7 +2331,14 @@ function getManeuverInstruction(step, destinationName) {
               <div className="itinerary-heading export-heading">
                 <h3>Your {transportModeLabel.toLowerCase()} journey</h3>
                 <div className="trip-action-buttons">
-                  <button type="button" className="save-trip-button" onClick={saveCurrentTrip}>Save trip</button>
+                  {activeTripId ? (
+                    <>
+                      <button type="button" className="save-trip-button" onClick={updateCurrentTrip}>Update saved trip</button>
+                      <button type="button" className="save-trip-button" onClick={saveAsNewCopy}>Save as new copy</button>
+                    </>
+                  ) : (
+                    <button type="button" className="save-trip-button" onClick={saveCurrentTrip}>Save trip</button>
+                  )}
                   <button type="button" className="share-trip-button" onClick={exportTripFile}>Download share file</button>
                   <label className="import-trip-label">
                     Import shared trip
@@ -2570,8 +2665,6 @@ function getManeuverInstruction(step, destinationName) {
                     )
                   : null;
                 const arrivalIsValid = arrivalDate && !Number.isNaN(arrivalDate.getTime());
-                const steps = leg.steps || [];
-
                 return (
                   <div className="route-leg" key={`${index}-${from}-${to}`}>
                     <strong>{index + 1}. {from} → {to}</strong>
@@ -2590,24 +2683,6 @@ function getManeuverInstruction(step, destinationName) {
                       </p>
                     )}
 
-                    <details className="route-directions">
-                      <summary>Turn-by-turn directions ({steps.length} steps)</summary>
-                      {steps.length > 0 ? (
-                        <ol className="direction-steps">
-                          {steps.map((step, stepIndex) => (
-                            <li key={`${index}-${stepIndex}`}>
-                              <div>
-                                <strong>{getManeuverInstruction(step, to)}</strong>
-                                {step.ref && <span className="road-reference"> ({step.ref})</span>}
-                                <p>{formatDistance(step.distance)} · {formatDuration(step.duration)}</p>
-                              </div>
-                            </li>
-                          ))}
-                        </ol>
-                      ) : (
-                        <p>Detailed maneuver instructions are unavailable for this leg.</p>
-                      )}
-                    </details>
                   </div>
                 );
               })}

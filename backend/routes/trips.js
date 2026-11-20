@@ -29,6 +29,26 @@ router.post('/', async (req, res) => {
   res.status(201).json({ trip: tripForClient(trip) });
 });
 
+// PUT /api/trips/:id -> edit a trip owned by the logged-in user
+router.put('/:id', async (req, res) => {
+  if (!req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+    return res.status(400).json({ error: 'Invalid trip id.' });
+  }
+
+  const { name, ...data } = req.body || {};
+  if (!name || String(name).trim() === '') {
+    return res.status(400).json({ error: 'Trip name is required.' });
+  }
+
+  const trip = await Trip.findOneAndUpdate(
+    { _id: req.params.id, userId: req.userId },
+    { name: String(name).trim(), data, savedAt: data.savedAt || new Date() },
+    { new: true, runValidators: true }
+  );
+  if (!trip) return res.status(404).json({ error: 'Trip not found.' });
+  res.json({ trip: tripForClient(trip) });
+});
+
 // DELETE /api/trips/:id  -> delete one trip
 router.delete('/:id', async (req, res) => {
   const trip = await Trip.findOneAndDelete({ _id: req.params.id, userId: req.userId });

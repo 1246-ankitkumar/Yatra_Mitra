@@ -1,151 +1,525 @@
+
 const API_BASE = '/api';
+
+
+// ==================================================
+// 1. ACCESS TOKEN MANAGEMENT
+// ==================================================
 
 let accessToken = localStorage.getItem('token') || '';
 
 export function setAccessToken(token) {
-  accessToken = token || '';
-  if (token) localStorage.setItem('token', token);
-  else localStorage.removeItem('token');
+    accessToken = token || '';
+
+    if (token) {
+        localStorage.setItem('token', token);
+    } else {
+        localStorage.removeItem('token');
+    }
 }
-export function getAccessToken() { return accessToken; }
+
+export function getAccessToken() {
+    return accessToken;
+}
+
+
+// ==================================================
+// 2. EXPIRE SESSION
+// ==================================================
 
 function expireSession() {
-  setAccessToken('');
-  window.dispatchEvent(new Event('auth:expired'));
-  throw new Error('Your session expired. Please sign in again.');
+    setAccessToken('');
+
+    window.dispatchEvent(new Event('auth:expired'));
+
+    throw new Error('Session expired. Please login again.');
 }
+
+
+// ==================================================
+// 3. SEND REQUEST TO BACKEND
+// ==================================================
 
 async function rawRequest(path, options = {}) {
-  const headers = { ...(options.headers || {}) };
-  if (!(options.body instanceof FormData)) headers['Content-Type'] = headers['Content-Type'] || 'application/json';
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  let res;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { credentials: 'include', ...options, headers });
-  } catch {
-    throw new Error('Cannot reach the server. Check your internet connection and that the backend is running (npm start in /backend).');
-  }
-  const data = await res.json().catch(() => ({}));
-  return { res, data };
+
+    const headers = { ...options.headers };
+
+    // Set JSON header for normal requests
+    if (!(options.body instanceof FormData)) {
+        headers['Content-Type'] = 'application/json';
+    }
+
+    // Add access token
+    if (accessToken) {
+        headers.Authorization = 'Bearer ' + accessToken;
+    }
+
+    let response;
+
+    try {
+        response = await fetch(API_BASE + path, {
+            credentials: 'include',
+            ...options,
+            headers: headers
+        });
+    } catch (error) {
+        throw new Error('Server is not reachable.');
+    }
+
+    const data = await response.json().catch(() => ({}));
+
+    return {
+        response: response,
+        data: data
+    };
 }
+
+
+// ==================================================
+// 4. HANDLE REQUEST AND TOKEN REFRESH
+// ==================================================
 
 async function request(path, options = {}, retry = true) {
-  let { res, data } = await rawRequest(path, options);
-  if (res.status === 401 && retry && path !== '/auth/refresh' && path !== '/auth/login' && path !== '/auth/register') {
-    const r = await rawRequest('/auth/refresh', { method: 'POST' });
-    if (r.res.ok && r.data.accessToken) {
-      setAccessToken(r.data.accessToken);
-      ({ res, data } = await rawRequest(path, options));
-      if (res.status === 401) expireSession();
-    } else if (r.res.status === 401) {
-      expireSession();
-    } else if (r.res.ok) {
-      throw new Error('The session refresh did not return a valid access token.');
+
+    let result = await rawRequest(path, options);
+
+    let response = result.response;
+    let data = result.data;
+
+    // Check whether access token has expired
+    if (
+        response.status === 401 &&
+        retry &&
+        path !== '/auth/refresh' &&
+        path !== '/auth/login' &&
+        path !== '/auth/register'
+    ) {
+
+        // Request a new access token
+        const refresh = await rawRequest('/auth/refresh', {
+            method: 'POST'
+        });
+
+        if (refresh.response.ok && refresh.data.accessToken) {
+
+            setAccessToken(refresh.data.accessToken);
+
+            // Send the original request again
+            result = await rawRequest(path, options);
+
+            response = result.response;
+            data = result.data;
+
+            if (response.status === 401) {
+                expireSession();
+            }
+
+        } else if (refresh.response.status === 401) {
+            expireSession();
+
+        } else if (refresh.response.ok) {
+            throw new Error('Invalid access token.');
+        }
     }
-  }
-  if (!res.ok) {
-    const fallback = res.status >= 500
-      ? `The server had a problem (HTTP ${res.status}). Please try again in a moment.`
-      : `Request failed (HTTP ${res.status}).`;
-    throw new Error(data.error || fallback);
-  }
-  return data;
+
+    // Check errors
+    if (!response.ok) {
+        throw new Error(data.error || 'Request failed.');
+    }
+
+    return data;
 }
+
+
+// ==================================================
+// 5. COMMON API METHODS
+// ==================================================
 
 export const api = {
-  get: (path) => request(path),
-  post: (path, body) => request(path, { method: 'POST', body: JSON.stringify(body ?? {}) }),
-  put: (path, body) => request(path, { method: 'PUT', body: JSON.stringify(body ?? {}) }),
-  del: (path) => request(path, { method: 'DELETE' }),
+
+    get: function(path) {
+        return request(path);
+    },
+
+    post: function(path, body) {
+        return request(path, {
+            method: 'POST',
+            body: JSON.stringify(body || {})
+        });
+    },
+
+    put: function(path, body) {
+        return request(path, {
+            method: 'PUT',
+            body: JSON.stringify(body || {})
+        });
+    },
+
+    del: function(path) {
+        return request(path, {
+            method: 'DELETE'
+        });
+    }
 };
+
+
+// ==================================================
+// 6. AUTHENTICATION API
+// ==================================================
 
 export const authApi = {
-  login: (email, password) => api.post('/auth/login', { email, password }),
-  register: (name, email, password) => api.post('/auth/register', { name, email, password }),
-  me: () => api.get('/auth/me'),
-  logout: () => api.post('/auth/logout', {}),
-  refresh: () => api.post('/auth/refresh', {}),
-  profile: (body) => api.put('/auth/profile', body),
-  changePassword: (body) => api.post('/auth/change-password', body),
-  forgotPassword: (email) => api.post('/auth/forgot-password', { email }),
-  resetPassword: (token, newPassword) => api.post('/auth/reset-password', { token, newPassword }),
+
+    login: function(email, password) {
+        return api.post('/auth/login', {
+            email: email,
+            password: password
+        });
+    },
+
+    register: function(name, email, password) {
+        return api.post('/auth/register', {
+            name: name,
+            email: email,
+            password: password
+        });
+    },
+
+    me: function() {
+        return api.get('/auth/me');
+    },
+
+    logout: function() {
+        return api.post('/auth/logout', {});
+    },
+
+    refresh: function() {
+        return api.post('/auth/refresh', {});
+    },
+
+    profile: function(body) {
+        return api.put('/auth/profile', body);
+    },
+
+    changePassword: function(body) {
+        return api.post('/auth/change-password', body);
+    }
 };
+
+
+// ==================================================
+// 7. TRIPS API
+// ==================================================
 
 export const tripsApi = {
-  list: () => api.get('/trips'),
-  create: (trip) => api.post('/trips', trip),
-  remove: (id) => api.del(`/trips/${id}`),
+
+    list: function() {
+        return api.get('/trips');
+    },
+
+    create: function(trip) {
+        return api.post('/trips', trip);
+    },
+
+    update: function(id, trip) {
+        return api.put('/trips/' + id, trip);
+    },
+
+    remove: function(id) {
+        return api.del('/trips/' + id);
+    }
 };
+
+
+// ==================================================
+// 8. WISHLIST API
+// ==================================================
 
 export const wishlistApi = {
-  list: () => api.get('/wishlist'),
-  add: (item) => api.post('/wishlist', item),
-  remove: (id) => api.del(`/wishlist/${id}`),
+
+    list: function() {
+        return api.get('/wishlist');
+    },
+
+    add: function(item) {
+        return api.post('/wishlist', item);
+    },
+
+    remove: function(id) {
+        return api.del('/wishlist/' + id);
+    }
 };
+
+
+// ==================================================
+// 9. HISTORY API
+// ==================================================
+
 export const historyApi = {
-  list: () => api.get('/history'),
-  add: (item) => api.post('/history', item),
-  update: (id, item) => api.put(`/history/${id}`, item),
-  remove: (id) => api.del(`/history/${id}`),
+
+    list: function() {
+        return api.get('/history');
+    },
+
+    add: function(item) {
+        return api.post('/history', item);
+    },
+
+    update: function(id, item) {
+        return api.put('/history/' + id, item);
+    },
+
+    remove: function(id) {
+        return api.del('/history/' + id);
+    }
 };
+
+
+// ==================================================
+// 10. REVIEWS API
+// ==================================================
+
 export const reviewsApi = {
-  list: (destinationKey) => api.get(`/reviews${destinationKey ? `?destinationKey=${encodeURIComponent(destinationKey)}` : ''}`),
-  add: (item) => api.post('/reviews', item),
-  update: (id, item) => api.put(`/reviews/${id}`, item),
-  remove: (id) => api.del(`/reviews/${id}`),
+
+    list: function(destinationKey) {
+        let path = '/reviews';
+
+        if (destinationKey) {
+            path += '?destinationKey=' + encodeURIComponent(destinationKey);
+        }
+
+        return api.get(path);
+    },
+
+    add: function(item) {
+        return api.post('/reviews', item);
+    },
+
+    update: function(id, item) {
+        return api.put('/reviews/' + id, item);
+    },
+
+    remove: function(id) {
+        return api.del('/reviews/' + id);
+    }
 };
+
+
+// ==================================================
+// 11. SEARCH HISTORY API
+// ==================================================
+
 export const searchHistoryApi = {
-  list: () => api.get('/search-history'),
-  add: (query, filters) => api.post('/search-history', { query, filters }),
+
+    list: function() {
+        return api.get('/search-history');
+    },
+
+    add: function(query, filters) {
+        return api.post('/search-history', {
+            query: query,
+            filters: filters
+        });
+    }
 };
+
+
+// ==================================================
+// 12. PACKING API
+// ==================================================
+
 export const packingApi = {
-  list: () => api.get('/packing'),
-  generate: (payload) => api.post('/packing/generate', payload),
-  save: (item) => api.post('/packing', item),
-  update: (id, item) => api.put(`/packing/${id}`, item),
-  remove: (id) => api.del(`/packing/${id}`),
+
+    list: function() {
+        return api.get('/packing');
+    },
+
+    generate: function(payload) {
+        return api.post('/packing/generate', payload);
+    },
+
+    save: function(item) {
+        return api.post('/packing', item);
+    },
+
+    update: function(id, item) {
+        return api.put('/packing/' + id, item);
+    },
+
+    remove: function(id) {
+        return api.del('/packing/' + id);
+    }
 };
+
+
+// ==================================================
+// 13. NOTIFICATIONS API
+// ==================================================
+
 export const notificationsApi = {
-  list: () => api.get('/notifications'),
-  read: (id) => api.put(`/notifications/${id}/read`, {}),
+
+    list: function() {
+        return api.get('/notifications');
+    },
+
+    read: function(id) {
+        return api.put('/notifications/' + id + '/read', {});
+    }
 };
-export const dashboardApi = { get: () => api.get('/dashboard') };
+
+
+// ==================================================
+// 14. DASHBOARD API
+// ==================================================
+
+export const dashboardApi = {
+
+    get: function() {
+        return api.get('/dashboard');
+    }
+};
+
+
+// ==================================================
+// 15. BOOKINGS API
+// ==================================================
 
 export const bookingsApi = {
-  list: () => api.get('/bookings'),
-  create: (item) => api.post('/bookings', item),
-  cancel: (id) => api.del(`/bookings/${id}`),
+
+    list: function() {
+        return api.get('/bookings');
+    },
+
+    create: function(item) {
+        return api.post('/bookings', item);
+    },
+
+    cancel: function(id) {
+        return api.del('/bookings/' + id);
+    }
 };
+
+
+// ==================================================
+// 16. QUERY PARAMETERS
+// ==================================================
 
 function toQuery(params = {}) {
-  return new URLSearchParams(
-    Object.entries(params).filter(([, value]) => value != null && value !== '')
-  ).toString();
+
+    const searchParams = new URLSearchParams();
+
+    for (const key in params) {
+
+        const value = params[key];
+
+        if (value !== null && value !== undefined && value !== '') {
+            searchParams.append(key, value);
+        }
+    }
+
+    return searchParams.toString();
 }
 
+
+// ==================================================
+// 17. DESTINATIONS API
+// ==================================================
+
 export const destinationsApi = {
-  search: (params = {}) => api.get(`/destinations/search?${toQuery(params)}`),
-  autocomplete: (q, limit = 8) => api.get(`/destinations/autocomplete?${toQuery({ q, limit })}`),
-  categories: () => api.get('/destinations/categories'),
-  filters: () => api.get('/destinations/filters'),
-  popular: (limit = 8) => api.get(`/destinations/popular?${toQuery({ limit })}`),
-  trending: (limit = 8) => api.get(`/destinations/trending?${toQuery({ limit })}`),
-  get: (identifier) => api.get(`/destinations/${encodeURIComponent(identifier)}`),
-  details: (params = {}) => api.get(`/destinations/details?${toQuery(params)}`),
-  attractionDetails: (params = {}) => api.get(`/destinations/attraction?${toQuery(params)}`),
-  geocode: (q) => api.get(`/destinations/geocode?${toQuery({ q })}`),
-  nearbyPlaces: (params = {}) => api.get(`/destinations/nearby-places?${toQuery(params)}`),
-  nearbyHotels: (params = {}) => api.get(`/destinations/nearby-hotels?${toQuery(params)}`),
+
+    search: function(params = {}) {
+        return api.get('/destinations/search?' + toQuery(params));
+    },
+
+    autocomplete: function(q, limit = 8) {
+        return api.get('/destinations/autocomplete?' + toQuery({
+            q: q,
+            limit: limit
+        }));
+    },
+
+    categories: function() {
+        return api.get('/destinations/categories');
+    },
+
+    filters: function() {
+        return api.get('/destinations/filters');
+    },
+
+    popular: function(limit = 8) {
+        return api.get('/destinations/popular?' + toQuery({
+            limit: limit
+        }));
+    },
+
+    trending: function(limit = 8) {
+        return api.get('/destinations/trending?' + toQuery({
+            limit: limit
+        }));
+    },
+
+    get: function(identifier) {
+        return api.get('/destinations/' + encodeURIComponent(identifier));
+    },
+
+    details: function(params = {}) {
+        return api.get('/destinations/details?' + toQuery(params));
+    },
+
+    attractionDetails: function(params = {}) {
+        return api.get('/destinations/attraction?' + toQuery(params));
+    },
+
+    geocode: function(q) {
+        return api.get('/destinations/geocode?' + toQuery({
+            q: q
+        }));
+    },
+
+    nearbyPlaces: function(params = {}) {
+        return api.get('/destinations/nearby-places?' + toQuery(params));
+    },
+
+    nearbyHotels: function(params = {}) {
+        return api.get('/destinations/nearby-hotels?' + toQuery(params));
+    }
 };
+
+
+// ==================================================
+// 18. RECENTLY VIEWED API
+// ==================================================
 
 export const recentlyViewedApi = {
-  list: (limit = 12) => api.get(`/destinations/recently-viewed?${toQuery({ limit })}`),
-  record: (slug) => api.post('/destinations/recently-viewed', { slug }),
-  remove: (id) => api.del(`/destinations/recently-viewed/${id}`),
-  clear: () => api.del('/destinations/recently-viewed'),
+
+    list: function(limit = 12) {
+        return api.get('/destinations/recently-viewed?' + toQuery({
+            limit: limit
+        }));
+    },
+
+    record: function(slug) {
+        return api.post('/destinations/recently-viewed', {
+            slug: slug
+        });
+    },
+
+    remove: function(id) {
+        return api.del('/destinations/recently-viewed/' + id);
+    },
+
+    clear: function() {
+        return api.del('/destinations/recently-viewed');
+    }
 };
 
 
+// ==================================================
+// 19. ROUTES API
+// ==================================================
+
 export const routesApi = {
-  compare: (body) => api.post('/routes/compare', body),
+
+    compare: function(body) {
+        return api.post('/routes/compare', body);
+    }
 };
